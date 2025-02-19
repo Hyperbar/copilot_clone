@@ -1,9 +1,8 @@
 import base64
-import cv2
-import numpy as np  # Pour manipuler les tableaux d'images
-import openai
-import pyautogui
 from threading import Lock, Thread
+
+import cv2
+import openai
 from cv2 import VideoCapture, imencode
 from dotenv import load_dotenv
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -28,30 +27,35 @@ class WebcamStream:
     def start(self):
         if self.running:
             return self
+
         self.running = True
-        self.thread = Thread(target=self.update)
+
+        self.thread = Thread(target=self.update, args=())
         self.thread.start()
         return self
 
     def update(self):
         while self.running:
-            ret, frame = self.stream.read()
-            if not ret:
-                continue
-            with self.lock:
-                self.frame = frame
+            _, frame = self.stream.read()
+
+            self.lock.acquire()
+            self.frame = frame
+            self.lock.release()
 
     def read(self, encode=False):
-        with self.lock:
-            frame = self.frame.copy()
+        self.lock.acquire()
+        frame = self.frame.copy()
+        self.lock.release()
+
         if encode:
             _, buffer = imencode(".jpeg", frame)
             return base64.b64encode(buffer)
+
         return frame
 
     def stop(self):
         self.running = False
-        if hasattr(self, 'thread') and self.thread.is_alive():
+        if self.thread.is_alive():
             self.thread.join()
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
@@ -67,27 +71,38 @@ class Assistant:
             return
 
         print("Prompt:", prompt)
+
         response = self.chain.invoke(
             {"prompt": prompt, "image_base64": image.decode()},
             config={"configurable": {"session_id": "unused"}},
         ).strip()
 
         print("Response:", response)
+
         if response:
             self._tts(response)
 
     def _tts(self, response):
         player = PyAudio().open(format=paInt16, channels=1, rate=24000, output=True)
+
         with openai.audio.speech.with_streaming_response.create(
-            model="tts-1", voice="alloy", response_format="pcm", input=response
+            model="tts-1",
+            voice="alloy",
+            response_format="pcm",
+            input=response,
         ) as stream:
             for chunk in stream.iter_bytes(chunk_size=1024):
                 player.write(chunk)
 
     def _create_inference_chain(self, model):
         SYSTEM_PROMPT = """
-        You are a witty assistant that will use the chat history and the image
-        provided by the user to answer its questions.
+        You are a witty assistant that will use the chat history and the image 
+        provided by the user to answer its questions. Your job is to answer 
+        questions.
+
+        Use few words on your answers. Go straight to the point. Do not use any
+        emoticons or emojis. 
+
         Be friendly and helpful. Show some personality.
         """
 
@@ -95,58 +110,38 @@ class Assistant:
             [
                 SystemMessage(content=SYSTEM_PROMPT),
                 MessagesPlaceholder(variable_name="chat_history"),
-                ("human", [
-                    {"type": "text", "text": "{prompt}"},
-                    {"type": "image_url",
-                     "image_url": "data:image/jpeg;base64,{image_base64}"},
-                ]),
+                (
+                    "human",
+                    [
+                        {"type": "text", "text": "{prompt}"},
+                        {
+                            "type": "image_url",
+                            "image_url": "data:image/jpeg;base64,{image_base64}",
+                        },
+                    ],
+                ),
             ]
         )
 
         chain = prompt_template | model | StrOutputParser()
+
         chat_message_history = ChatMessageHistory()
         return RunnableWithMessageHistory(
-            chain, lambda _: chat_message_history, input_messages_key="prompt", history_messages_key="chat_history"
+            chain,
+            lambda _: chat_message_history,
+            input_messages_key="prompt",
+            history_messages_key="chat_history",
         )
 
 
-def take_screenshot():
-    """
-    Capture l'écran et renvoie l'image encodée en base64 (pour traitement)
-    """
-    screenshot = pyautogui.screenshot()
-    # Convertir l'image en format BGR pour OpenCV
-    image = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-    _, buffer = imencode(".jpeg", image)
-    return base64.b64encode(buffer)
+webcam_stream = WebcamStream().start()
 
+# model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest")
 
-def take_screenshot_display():
-    """
-    Capture l'écran et renvoie l'image (pour affichage)
-    """
-    screenshot = pyautogui.screenshot()
-    image = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-    return image
-
-
-def get_image_source():
-    choice = input(
-        "Choisissez la source d'image (1: Webcam, 2: Capture d'écran): ")
-    if choice == "1":
-        return WebcamStream().start()  # Mode webcam
-    elif choice == "2":
-        return None  # Mode capture d'écran
-    else:
-        print("Choix invalide. Utilisation de la webcam par défaut.")
-        return WebcamStream().start()
-
-
-# Obtenir la source d'image choisie par l'utilisateur
-image_source = get_image_source()
-
-# Création du modèle et de l'assistant
+# You can use OpenAI's GPT-4o model instead of Gemini Flash
+# by uncommenting the following line:
 model = ChatOpenAI(model="gpt-4o")
+
 assistant = Assistant(model)
 
 
@@ -154,14 +149,10 @@ def audio_callback(recognizer, audio):
     try:
         prompt = recognizer.recognize_whisper(
             audio, model="base", language="english")
-        # Utiliser la bonne source d'image pour le traitement
-        if image_source:
-            image = image_source.read(encode=True)
-        else:
-            image = take_screenshot()
-        assistant.answer(prompt, image)
+        assistant.answer(prompt, webcam_stream.read(encode=True))
+
     except UnknownValueError:
-        print("Erreur de reconnaissance vocale.")
+        print("There was an error processing the audio.")
 
 
 recognizer = Recognizer()
@@ -171,26 +162,11 @@ with microphone as source:
 
 stop_listening = recognizer.listen_in_background(microphone, audio_callback)
 
-if image_source:
-    # Mode webcam : afficher un flux en direct dans une fenêtre unique
-    window_title = "Vue en direct de la Webcam"
-    # Créer une fenêtre redimensionnable
-    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
-    while True:
-        frame = image_source.read()
-        cv2.imshow(window_title, frame)
-        key = cv2.waitKey(1)
-        # Quitte si 'q' ou Échap est appuyé
-        if key == 27 or key == ord("q"):
-            break
-    image_source.stop()
-    cv2.destroyAllWindows()
-else:
-    # Mode capture d'écran : afficher une capture d'une seule image statique
-    window_title = "Capture d'écran"
-    frame = take_screenshot_display()
-    cv2.imshow(window_title, frame)
-    cv2.waitKey(0)  # Attend une touche pour fermer
-    cv2.destroyAllWindows()
+while True:
+    cv2.imshow("webcam", webcam_stream.read())
+    if cv2.waitKey(1) in [27, ord("q")]:
+        break
 
+webcam_stream.stop()
+cv2.destroyAllWindows()
 stop_listening(wait_for_stop=False)
