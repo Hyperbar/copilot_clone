@@ -1,5 +1,6 @@
 import base64
 import cv2
+import numpy as np  # Pour manipuler les tableaux d'images
 import openai
 import pyautogui
 from threading import Lock, Thread
@@ -27,22 +28,22 @@ class WebcamStream:
     def start(self):
         if self.running:
             return self
-
         self.running = True
-        self.thread = Thread(target=self.update, args=())
+        self.thread = Thread(target=self.update)
         self.thread.start()
         return self
 
     def update(self):
         while self.running:
-            _, frame = self.stream.read()
+            ret, frame = self.stream.read()
+            if not ret:
+                continue
             with self.lock:
                 self.frame = frame
 
     def read(self, encode=False):
         with self.lock:
             frame = self.frame.copy()
-
         if encode:
             _, buffer = imencode(".jpeg", frame)
             return base64.b64encode(buffer)
@@ -97,7 +98,7 @@ class Assistant:
                 ("human", [
                     {"type": "text", "text": "{prompt}"},
                     {"type": "image_url",
-                        "image_url": "data:image/jpeg;base64,{image_base64}"},
+                     "image_url": "data:image/jpeg;base64,{image_base64}"},
                 ]),
             ]
         )
@@ -110,25 +111,41 @@ class Assistant:
 
 
 def take_screenshot():
+    """
+    Capture l'écran et renvoie l'image encodée en base64 (pour traitement)
+    """
     screenshot = pyautogui.screenshot()
-    _, buffer = imencode(".jpeg", cv2.cvtColor(
-        np.array(screenshot), cv2.COLOR_RGB2BGR))
+    # Convertir l'image en format BGR pour OpenCV
+    image = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+    _, buffer = imencode(".jpeg", image)
     return base64.b64encode(buffer)
+
+
+def take_screenshot_display():
+    """
+    Capture l'écran et renvoie l'image (pour affichage)
+    """
+    screenshot = pyautogui.screenshot()
+    image = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+    return image
 
 
 def get_image_source():
     choice = input(
         "Choisissez la source d'image (1: Webcam, 2: Capture d'écran): ")
     if choice == "1":
-        return WebcamStream().start()
+        return WebcamStream().start()  # Mode webcam
     elif choice == "2":
-        return None
+        return None  # Mode capture d'écran
     else:
         print("Choix invalide. Utilisation de la webcam par défaut.")
         return WebcamStream().start()
 
 
+# Obtenir la source d'image choisie par l'utilisateur
 image_source = get_image_source()
+
+# Création du modèle et de l'assistant
 model = ChatOpenAI(model="gpt-4o")
 assistant = Assistant(model)
 
@@ -137,8 +154,11 @@ def audio_callback(recognizer, audio):
     try:
         prompt = recognizer.recognize_whisper(
             audio, model="base", language="english")
-        image = image_source.read(
-            encode=True) if image_source else take_screenshot()
+        # Utiliser la bonne source d'image pour le traitement
+        if image_source:
+            image = image_source.read(encode=True)
+        else:
+            image = take_screenshot()
         assistant.answer(prompt, image)
     except UnknownValueError:
         print("Erreur de reconnaissance vocale.")
@@ -152,13 +172,25 @@ with microphone as source:
 stop_listening = recognizer.listen_in_background(microphone, audio_callback)
 
 if image_source:
+    # Mode webcam : afficher un flux en direct dans une fenêtre unique
+    window_title = "Vue en direct de la Webcam"
+    # Créer une fenêtre redimensionnable
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
     while True:
-        cv2.imshow("webcam", image_source.read())
-        if cv2.waitKey(1) in [27, ord("q")]:
+        frame = image_source.read()
+        cv2.imshow(window_title, frame)
+        key = cv2.waitKey(1)
+        # Quitte si 'q' ou Échap est appuyé
+        if key == 27 or key == ord("q"):
             break
     image_source.stop()
     cv2.destroyAllWindows()
 else:
-    input("Appuyez sur Entrée pour quitter...")
+    # Mode capture d'écran : afficher une capture d'une seule image statique
+    window_title = "Capture d'écran"
+    frame = take_screenshot_display()
+    cv2.imshow(window_title, frame)
+    cv2.waitKey(0)  # Attend une touche pour fermer
+    cv2.destroyAllWindows()
 
 stop_listening(wait_for_stop=False)
